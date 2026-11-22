@@ -1,0 +1,5 @@
+model	taxon	lfc	q_value	direction
+unadjusted	d__Bacteria;p__Actinobacteriota;c__Coriobacteriia;o__Coriobacteriales;f__Coriobacteriales_Incertae_Sedis;g__uncultured	-1.8035	0.01819	control
+unadjusted	d__Bacteria;p__Bacteroidota;c__Bacteroidia;o__Bacteroidales;f__Bacteroidaceae;g__Bacteroides	0.5250	0.02726	mecfs
+adjusted	d__Bacteria;p__Bacteroidota;c__Bacteroidia;o__Bacteroidales;f__Bacteroidaceae;g__Bacteroides	0.5365	0.01128	mecfs
+adjusted	d__Bacteria;p__Actinobacteriota;c__Coriobacteriia;o__Coriobacteriales;f__Coriobacteriales_Incertae_Sedis;g__uncultured	-1.7154	0.03875	control

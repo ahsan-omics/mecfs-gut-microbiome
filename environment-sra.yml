@@ -1,0 +1,19 @@
+name: mecfs-sra
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python>=3.9
+  - sra-tools>=3.0
+
+# Used by one rule only: 02_download_reads.py.
+#
+# The main analysis runs in the QIIME 2 environment, which is installed separately from
+# the official distribution (see the README). They are kept apart because QIIME 2 pins a
+# large dependency set and adding sra-tools to it invites conflicts for the sake of a
+# single step.
+#
+# Note that the download step never asks sra-tools to resolve an accession. It fetches
+# the .sra object by URL and hands fasterq-dump a local file path, because accession
+# resolution fails on some machines with "Failed to call external services" and a local
+# file bypasses that code path entirely.

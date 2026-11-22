@@ -1,0 +1,383 @@
+# ME/CFS gut microbiome, 16S amplicon analysis
+#
+# Every value is either verified against the archive (with the record named) or a decision
+# with its reasoning stated.
+
+project:
+  name: mecfs-gut-microbiome
+  version: 0.1.0
+
+dataset:
+  bioproject: PRJNA1332076
+  title: ME/CFS gut microbiome
+  # Verified against the archive 2026-11-22:
+  expected_runs: 63
+  expected_groups: {ME/CFS: 30, control: 33}
+  total_size_mb: 315
+  instrument: Illumina iSeq 100
+  layout: PAIRED
+  read_length: 151
+
+  # THE AMPLICON LENGTH PROBLEM, found before downloading anything.
+  #
+  # The SRA design description says "16SrRNA gene V3V4 primer amplicons, dual indexed"
+  # and the reads are 2 x 151 bp. A V3-V4 amplicon is roughly 460 bp, so two 151 bp reads
+  # give 302 bp of sequence and leave about 160 bp unsequenced in the middle. The forward
+  # and reverse reads therefore DO NOT OVERLAP and cannot be merged. 2 x 151 is the right
+  # length for V4 alone (~254 bp), not for V3-V4.
+  #
+  # Consequence: the analysis uses FORWARD READS ONLY, which cover V3 and part of V4 and
+  # are fine for genus level taxonomy. Both mates are still downloaded so that
+  # 02_read_quality.py can demonstrate the non-overlap from the data rather than asserting
+  # it from this comment.
+  #
+  # This matters because DADA2's merge step does not error on non-overlapping reads. It
+  # silently discards almost everything and reports a successful run.
+  amplicon_region: V3-V4
+  approximate_amplicon_bp: 460
+  reads_usable: forward_only
+
+download_route:
+  # HOW TO GET THE READS, and the two dead ends that came first. Worked out 2026-11-22.
+  #
+  # ENA is not an option. It mirrors this project's metadata (study SRP623377) but holds
+  # no files at all: fastq_ftp, submitted_ftp and sra_ftp are every one of them empty.
+  #
+  # SRA stores TWO versions of every run and this is the thing that matters:
+  #
+  #   Normalized  the original quality scores as submitted.
+  #   SRA Lite    the same reads with every quality score replaced by one synthesised
+  #               constant, to save space. sra-tools even has a config toggle for which
+  #               version you prefer.
+  #
+  # Both the trace.ncbi.nlm.nih.gov/Traces/sra-reads-be/fastq endpoint and the
+  # `download_path` column in SRA's own runinfo serve SRA LITE. Reads fetched that way
+  # come back with a perfectly flat Q30 at every position of every read.
+  #
+  # That is catastrophic here and it fails silently. DADA2's entire method is fitting an
+  # error model to the quality scores, so with one quality value there is nothing to fit,
+  # maxEE filtering becomes meaningless, and choosing a truncation point from the quality
+  # profile is choosing from a flat line. Nothing errors. You just get bad ASVs.
+  #
+  # The public S3 object store serves the Normalized version, which has the real scores.
+  # Verified on SRR35529922: the S3 object is 3.20 MB against 2.93 MB for the .lite.1,
+  # and its quality characters are ",:F" (Phred 11, 25, 37) rather than a single "?".
+  #
+  # So: always this URL pattern, never runinfo's download_path.
+  sra_url_template: https://sra-pub-run-odp.s3.amazonaws.com/sra/{run}/{run}
+
+  # fasterq-dump cannot resolve accessions on this machine ("Failed to call external
+  # services", and vdb-config --restore-defaults did not fix it). It works perfectly when
+  # handed a local .sra file, which is what the download step does, so the resolver is
+  # never involved.
+  converter: fasterq-dump
+  converter_args: [--split-files]
+
+  # Verification. The S3 bucket exposes no checksum, so instead the spot count of the
+  # converted FASTQ is checked against the spot count SRA reports in runinfo. A truncated
+  # download fails this.
+  verify_spot_counts: true
+  gzip_output: true
+  keep_sra_files: false
+
+sample_filtering:
+  # EXCLUSION RULE, decided from the data on 2026-11-22.
+  #
+  # Two samples have almost no reads: SRR35529956 with 219 and SRR35529933 with 323.
+  # The next shallowest has 20,848, a sixty-fold gap. That is not a shallow tail, it is
+  # two libraries that failed, and the gap is what makes the threshold defensible: any
+  # value between 1,000 and 20,000 excludes exactly the same two samples, so the result
+  # does not depend on where the line is drawn.
+  #
+  # Consequences, both good. Group sizes go from 33/30 to 31 control and 30 ME/CFS, so
+  # the design gets more balanced, not less. And the rarefaction depth stops being
+  # hostage to a 219-read sample: the minimum among the rest is 20,848, so roughly
+  # 20,000 keeps all 61 samples instead of discarding almost everything to accommodate
+  # one failure.
+  #
+  # Both failures are controls. Worth stating in the README, because dropping controls
+  # slightly reduces power to detect a difference rather than manufacturing one.
+  min_reads: 1000
+
+primers:
+  # Read directly off the reads, not taken from the paper. R1 begins with 341F and R2
+  # with 805R, the standard V3-V4 pair. IUPAC degenerate codes included, because the
+  # degeneracy is the reason untrimmed primers inflate ASV counts: the same organism
+  # appears several times, once per primer variant.
+  forward: {name: 341F, sequence: CCTACGGGNGGCWGCAG}
+  reverse: {name: 805R, sequence: GACTACHVGGGTATCTAATCC}
+
+read_diagnostics:
+  # Per-position quality and primer stats are computed on a subsample per file, because
+  # 63 files times about 40,000 reads is more character processing than this step needs
+  # to answer the question. Read COUNTS are exact, taken from a full pass.
+  subsample_reads: 5000
+  # The overlap test is quadratic in read length, so it runs on far fewer pairs. It only
+  # has to demonstrate an absence.
+  overlap_test_samples: 5
+  overlap_test_pairs: 200
+  overlap_min_length: 20
+  overlap_max_mismatch_fraction: 0.10
+
+  # TRUNCATION RULE, stated so it is a decision and not a default.
+  #
+  # The usual advice, "truncate where the quality curve falls off", assumes continuous
+  # Phred scores. These are binned to Q11/Q25/Q37, so there is no smooth curve to read.
+  # The rule used instead: keep the longest prefix in which at least this fraction of
+  # bases are Q25 or better. Reported alongside two alternatives so the choice is visible.
+  truncation_min_fraction_at_or_above: 25
+  truncation_fraction_threshold: 0.80
+
+statistics:
+  group_column: group
+  reference_level: control
+  covariates: [age, sex, bmi]
+  permutations: 999
+
+  # ADONIS TERM ORDER. vegan's adonis2 is sequential by default, so each term is adjusted
+  # only for the terms BEFORE it. Putting group last therefore tests it after age, sex and
+  # BMI have taken their variance, which is the conservative reading. Both orders are run
+  # and compared: if they disagree, the covariates share variance with disease status and
+  # that is itself worth reporting.
+  adonis_formula_adjusted: "age+sex+bmi+group"
+  adonis_formula_group_first: "group+age+sex+bmi"
+
+  # DIFFERENTIAL ABUNDANCE. Collapsed to genus because 134 bp of V3 does not support
+  # species, and because fewer features means less multiple-testing burden.
+  taxa_level: 6
+
+  # Prevalence filter, applied HERE and deliberately not before diversity. Testing a
+  # genus seen in three samples costs power through multiple testing and cannot produce a
+  # trustworthy estimate. Before diversity the same filter would have biased richness.
+  min_samples_fraction: 0.10
+
+  # ANCOM-BC runs on the UNRAREFIED table. It models compositionality and varying library
+  # sizes directly, so feeding it rarefied counts would discard two thirds of the reads
+  # for no benefit. Rarefying everything is a common and avoidable mistake.
+  use_rarefied_for_da: false
+
+  # ANCOM-BC CANNOT TAKE NUMERIC COVARIATES in q2-composition 2025.7. This is a plugin
+  # bug, confirmed in its source on 2026-11-22.
+  #
+  # _ancombc.py builds a reference level for each formula term. At line 112 it correctly
+  # checks isinstance(..., CategoricalMetadataColumn) first. But a SECOND loop at line 208
+  # ("Adding any column::value defaults from formula terms") has no such check and runs
+  # unconditionally, so numeric terms get a reference level whatever you pass. The R side
+  # then does factor(md[[column]]) followed by relevel(ref = "27.0"), and since factor()
+  # renders 27.0 as the level "27", the reference does not exist:
+  #     Error in relevel.factor(...) : 'ref' must be an existing level
+  # Even had the strings matched, age would have been fitted as a 40-level factor.
+  #
+  # Verified: an all-categorical formula runs fine, so the workaround is to adjust for age
+  # and BMI as TERTILES. That costs resolution, since a continuous covariate becomes three
+  # ordered bins, but it keeps the adjustment and is ordinary epidemiological practice.
+  # Tertiles rather than clinical BMI categories because tertiles guarantee balanced bins
+  # and no near-empty level; here they come out 20/20/21 on both variables.
+  #
+  # Both models are run and compared. If they agree, the adjustment is not doing much,
+  # which is what a design already matched on age, sex and BMI should produce.
+  tertile_columns: [age, bmi]
+  ancombc_formula_unadjusted: "group"
+  ancombc_formula_adjusted: "group + sex + age_tertile + bmi_tertile"
+
+diversity:
+  # Everything here runs through QIIME 2 plugins rather than analysis code written for
+  # this repo. That is the right tool regardless: these are the community standard
+  # implementations and nobody writes their own PERMANOVA for a 16S study. It also means
+  # no code from the private BiomeDelta pipeline is anywhere near this repository.
+
+  # Rarefaction depth. null means "use the shallowest sample in the FILTERED table", so
+  # every sample is kept. Losing a sample costs more than losing reads does, as long as
+  # the shallowest is not an outlier; 06 prints the table that shows whether it is.
+  # Set a number here to override.
+  sampling_depth: null
+
+  # Upper limit for the rarefaction curve, used to check that the chosen depth sits past
+  # the point where richness stops climbing. null means the median sample depth.
+  rarefaction_max_depth: null
+  rarefaction_steps: 20
+  rarefaction_iterations: 10
+
+  # Produced by core-metrics-phylogenetic. Listed here so later steps and the README
+  # refer to one source rather than hard-coding names in several places.
+  alpha_metrics: [shannon, observed_features, faith_pd, evenness]
+  # These must match the filenames core-metrics-phylogenetic writes. It produces
+  # bray_curtis_distance_matrix.qza with an underscore, and an earlier version of this
+  # list said "braycurtis", so Bray-Curtis was silently skipped by 08 with no warning.
+  beta_metrics: [bray_curtis, jaccard, unweighted_unifrac, weighted_unifrac]
+
+  threads: 4
+
+filtering:
+  # Applied after taxonomy and before the tree, so the phylogeny is built from the
+  # features that actually get analysed.
+  #
+  # Mitochondria and chloroplast are 16S-like sequences from host and plant material.
+  # They amplify with bacterial primers and are not part of the bacterial community, so
+  # leaving them in inflates diversity and distorts composition.
+  #
+  # Features with no phylum-level assignment are dropped as well: at 134 bp a sequence
+  # that cannot be placed even to phylum is far more likely to be an artefact than a
+  # novel lineage, and it would contribute to UniFrac distances through a branch nobody
+  # can interpret.
+  exclude_taxa: [mitochondria, chloroplast]
+  require_rank: "p__"
+
+  # NO abundance or prevalence filter here, deliberately. Rare features carry real
+  # information for richness and evenness, so removing them before diversity would bias
+  # alpha diversity downward in exactly the samples that have most of them. Prevalence
+  # filtering belongs at the differential abundance step, where testing thousands of
+  # near-empty features costs power through multiple testing, and it is applied there.
+
+phylogeny:
+  # mafft alignment, variable-position masking, FastTree, midpoint rooting. Needed for
+  # UniFrac distances and Faith's phylogenetic diversity.
+  #
+  # Caveat for the README: this tree is built from 134 bp alignments. A short alignment
+  # supports far less phylogenetic signal than a full-length one, so UniFrac distances
+  # here are coarser than the same analysis on full-length 16S. It is still the right
+  # method, it just carries a wider error bar, and that is the sequencing design showing
+  # through again rather than a choice made here.
+  threads: 4
+
+taxonomy:
+  # WHY NOT THE NAIVE BAYES CLASSIFIER, which is the usual choice.
+  #
+  # A pre-trained SILVA 138 naive Bayes classifier exists and matches this environment's
+  # scikit-learn (1.4.2), but it needs upwards of 8 GB of RAM just to load. This machine
+  # has 7 GB total with about 3 GB free, so it would be killed. classify-consensus-vsearch
+  # streams alignments instead of holding a trained model, so its memory use is a
+  # fraction of that. It is a standard QIIME 2 method that benchmarks comparably to naive
+  # Bayes, not a compromise.
+  #
+  # WHY THE REFERENCE IS TRIMMED FIRST.
+  #
+  # The reads are 134 bp of V3. Searching them against full-length 1500 bp references
+  # means holding roughly 700 Mbp in memory and aligning against regions the reads never
+  # covered. Extracting the same 341F/805R amplicon from SILVA and truncating it to 134 bp
+  # cuts the reference to about 67 Mbp, which removes the memory problem completely, runs
+  # far faster, and is the more accurate pairing because reference and query then describe
+  # the same stretch of the gene.
+  #
+  # THE COST, which is the data's and not ours. 134 bp of V3 carries less information than
+  # full V3-V4 would. Expect many ASVs to resolve to genus or family and few to species.
+  # That ceiling comes from the sequencing design (2 x 151 on a 460 bp amplicon, so the
+  # reverse read is unusable), not from this choice, and the README should say so.
+  reference_seqs_url: https://data.qiime2.org/2024.10/common/silva-138-99-seqs.qza
+  reference_tax_url: https://data.qiime2.org/2024.10/common/silva-138-99-tax.qza
+  reference_dir: reference
+
+  extract_region: true
+  extract_min_length: 100
+  extract_max_length: 600
+
+  # QIIME 2 defaults for classify-consensus-vsearch. Permissive identity on purpose: the
+  # consensus vote across maxaccepts hits is what provides the specificity.
+  perc_identity: 0.80
+  query_cov: 0.80
+  maxaccepts: 10
+  min_consensus: 0.51
+  threads: 4
+
+cutadapt:
+  # The 341F primer is removed from the 5' end. --discard-untrimmed drops the ~5.6% of
+  # reads where it was not found: those are reads whose primer carries more mismatches
+  # than the error rate allows, or off-target product, and either way they are not what
+  # the assay was aiming at.
+  error_rate: 0.1
+  discard_untrimmed: true
+  cores: 4
+
+denoising:
+  # trunc_len comes from 03_read_diagnostics.py and is measured against the PRIMER
+  # TRIMMED read: 151 bp raw minus 17 bp of 341F. Quality holds to the last base, so
+  # nothing useful is being discarded, the figure is just the post-cutadapt length.
+  trunc_len: 134
+  trim_left: 0
+
+  # Both of DADA2's quality filters are effectively inert on this data and that is worth
+  # knowing rather than assuming. max_ee counts expected errors, and at a floor of Q11
+  # even a whole read of the worst bases comes nowhere near 2. trunc_q cuts at the first
+  # base of quality <= 2, and no Q2 bases exist here at all. They are left at their
+  # defaults because they do no harm, not because they are doing work.
+  max_ee: 2
+  trunc_q: 2
+
+  chimera_method: consensus
+  pooling_method: independent
+  threads: 4
+
+  # BINNED QUALITY SCORES, the one real risk in this step.
+  #
+  # DADA2 learns an error model by fitting a loess curve of observed error rate against
+  # quality score, which assumes continuous Phred values. These are binned to Q11, Q25
+  # and Q37, so the curve is being fitted through three points. The documented symptom is
+  # an error model that does not decrease monotonically with quality, which is
+  # biologically impossible and leads to over-splitting: one organism resolved into
+  # several ASVs.
+  #
+  # QIIME 2's dada2 plugin does not expose an error-model override, so this is handled by
+  # CHECKING rather than pre-emptively patching. The denoising stats and the ASV count
+  # are the evidence. Signs of trouble: poor retention through the denoise step, or an
+  # ASV count far above what 61 gut samples should yield. If it shows up, the fix is to
+  # run DADA2 in R with a monotonicity-enforcing error function and import the result.
+  #
+  # Doing it this way round means the decision is driven by what the data does, not by a
+  # precaution taken against a problem that may not appear.
+  expect_binned_quality_issue: check
+
+quality:
+  # The real scores are BINNED, not continuous: Illumina's four-level scheme, which
+  # NovaSeq, iSeq and NextSeq all use. Observed values here are Q11, Q25 and Q37.
+  #
+  # DADA2's error model was built around granular quality values and its loess fit is
+  # known to behave poorly on binned scores. This needs handling at the denoising step,
+  # by enforcing monotonicity or using a modified error function, rather than being
+  # discovered there. Noted now so it is not a surprise later.
+  binned: true
+  observed_phred: [11, 25, 37]
+
+biosample:
+  # Per-sample attributes confirmed present in the archive for all 63 samples. This is
+  # why this dataset was chosen: no supplementary table to chase, no PDF to parse.
+  # Attribute name in BioSample -> column name in the QIIME 2 metadata file.
+  attribute_map:
+    host_disease: group
+    host_age: age
+    host_sex: sex
+    host_body_mass_index: bmi
+    ethnicity: ethnicity
+    collection_date: collection_date
+
+  # QIIME 2 needs a type line. Anything not listed here is treated as categorical.
+  numeric_columns: [age, bmi]
+
+  # Fields the analysis actually depends on. A gap in any of these is a hard failure,
+  # because an empty cell here silently drops a sample from the statistics several steps
+  # later. Verified complete for all 63 samples on 2026-11-22.
+  required_columns: [group, age, sex, bmi]
+
+  # Recorded and kept, but not modelled, so gaps are reported and tolerated. Two samples
+  # (SRR35529916 and SRR35529952) have no ethnicity value. The cohort is from a single US
+  # site, so ethnicity was never going to carry much signal as a covariate; the standard
+  # confounders for gut microbiome composition are age, sex and BMI, which are complete.
+  optional_columns: [ethnicity, collection_date]
+
+  # Normalise the raw host_disease values into two tidy labels. Checked against the
+  # archive: the only values present are "control" and the ME/CFS label.
+  group_labels:
+    control: control
+    "ME/CFS": mecfs
+
+download:
+  # Both mates are fetched. Forward only is used for denoising, but having R2 lets the
+  # quality script prove the overlap arithmetic from real reads.
+  keep_reverse_reads: true
+  verify_md5: true
+
+environments:
+  # Everything runs in the QIIME 2 environment except the download step, which needs
+  # sra-tools. The Snakefile shells that one rule out through `conda run -n <this>`,
+  # so no combined environment has to be built.
+  qiime2: qiime2-amplicon-2025.7
+  sra_tools: bioenv
