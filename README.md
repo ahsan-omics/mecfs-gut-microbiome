@@ -53,43 +53,39 @@ a change in amount, which is not what the data shows.
 Illumina iSeq 100, 16S V3-V4 with the 341F/805R primers. Nothing is included in this
 repository; the workflow downloads it.
 
-The dataset was chosen because **the sample phenotypes are in the archive itself**, not
-buried in a supplementary table. Disease status, age, sex and BMI are recorded per sample on
-every BioSample record. Two other candidate datasets were rejected for failing that test.
+Disease status, age, sex and BMI are recorded per sample on the BioSample records, so the
+workflow builds its metadata table straight from the archive rather than from a supplementary
+file.
 
-It is also a **matched design**, which was verified rather than assumed: median age 55
+It is a **matched design**, verified rather than assumed: median age 55
 against 52, median BMI 23.9 against 24.6, and 58% against 57% female. That matching is why
 adjusting for those covariates barely moves the result.
 
 Final analysis set: **61 samples, 31 control and 30 ME/CFS**.
 
-## Things worth knowing about this data
+## Known pitfalls
 
-These cost real time to find, so they are written down.
+Each of these produces a wrong result without producing an error, which is why they are
+worth stating.
 
-**SRA serves two versions of every run, and the obvious one is wrong for this.** The
-"SRA Lite" version replaces every quality score with a single constant. Both the
-`trace.ncbi.nlm.nih.gov` FASTQ endpoint and the `download_path` column in SRA's own run
-table serve Lite. DADA2 builds its error model from quality scores, so Lite data produces
-bad results with nothing appearing to go wrong. The workflow downloads from the S3 object
-store instead, which serves the original scores.
+> **Do not download from the obvious place.** SRA stores two versions of every run, and
+> "SRA Lite" replaces every quality score with one constant. Both the `trace.ncbi.nlm.nih.gov`
+> FASTQ endpoint and the `download_path` column in SRA's run table serve Lite. DADA2 fits its
+> error model to quality scores, so Lite data gives you bad ASVs and no error message. This
+> workflow pulls from the S3 object store, which keeps the real scores.
 
-**The paired reads cannot be merged.** The amplicon is about 460 bp and the reads are
-2 x 151, leaving a gap of roughly 160 bp in the middle. Measured on 1,000 real read pairs,
-1.0% show any overlap, which is what chance produces. DADA2's merge step does not fail on
-non-overlapping reads; it silently discards almost everything and reports success. The
-analysis uses forward reads only.
+> **Do not merge the paired reads.** The amplicon is about 460 bp and the reads are 2 x 151,
+> so roughly 160 bp in the middle was never sequenced. Measured on 1,000 real pairs, 1.0%
+> overlap, which is chance. DADA2's merge step does not fail on non-overlapping reads. It
+> discards almost everything and reports success. Forward reads only.
 
-**Two libraries failed.** Two samples have 219 and 323 reads against a next-shallowest of
-20,848. Both are controls. They are excluded, which leaves the groups better balanced than
-before.
+> **Two libraries failed.** Two samples have 219 and 323 reads against a next-shallowest of
+> 20,848. Both are controls, and both are excluded.
 
-**Rarefying does not fully remove the depth effect.** After rarefying every sample to the
-same depth, the original sequencing depth still predicts observed richness (Spearman 0.40).
-The cause is that DADA2 resolves ASVs before rarefying, and deeply sequenced samples give it
-more power to call rare variants as real. Shannon diversity is unaffected (0.05), which is
-why it is the measure weighted most here. Depth does not differ between groups, so this adds
-noise rather than bias.
+> **Rarefying does not remove the depth effect.** With every sample rarefied to the same
+> depth, original depth still predicts observed richness (Spearman 0.40), because DADA2 calls
+> ASVs before rarefying and deeper samples yield more of them. Shannon is unaffected (0.05),
+> which is why it carries most weight here.
 
 ## Running it
 
@@ -117,11 +113,21 @@ Set an email address for NCBI, which asks automated clients to identify themselv
 export NCBI_EMAIL="your.address@example.com"
 ```
 
-Expect about 315 MB of reads and 100 MB of SILVA reference to download, and a few hours of
-compute on a laptop. Every step skips work whose output already exists, so an interrupted
-run picks up where it stopped.
+Expect about 315 MB of reads and 100 MB of SILVA reference to download, and roughly half an
+hour of compute on a laptop. Every step skips work whose output already exists, so an
+interrupted run picks up where it stopped.
 
 ## What the workflow does
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="results/figures/workflow_dark.png">
+  <img alt="Workflow diagram: reads from SRA and phenotypes from BioSample join, the reverse reads are dropped because the mates do not overlap, and the feature table splits into a rarefied branch for diversity and an unrarefied branch for differential abundance." src="results/figures/workflow_light.png">
+</picture>
+
+The split near the bottom is the part worth looking at. Diversity measures are sensitive to
+sequencing depth, so that branch is rarefied. ANCOM-BC models compositionality and library
+size itself, so feeding it rarefied counts would throw away two thirds of the reads for
+nothing. Rarefying everything is a common and avoidable mistake.
 
 | step | what happens |
 |---|---|
@@ -137,6 +143,33 @@ run picks up where it stopped.
 
 Every decision and the reasoning behind it is in [`config/config.yaml`](config/config.yaml).
 It is worth reading if you want to know why a parameter has the value it has.
+
+## Using it on a different dataset
+
+The workflow is tied to this BioProject by configuration, not by code. To point it at
+another 16S study, edit [`config/config.yaml`](config/config.yaml):
+
+| change | where |
+|---|---|
+| the accession | `dataset.bioproject`, plus `expected_runs` and `expected_groups` |
+| which BioSample fields become metadata columns | `biosample.attribute_map` |
+| the group labels in `host_disease` | `biosample.group_labels` |
+| your primer sequences | `primers` |
+| read length and amplicon length | `dataset` |
+| the formulas | `statistics` |
+
+Then run `snakemake` and read what step 03 tells you. It measures read quality, detects your
+primers and tests whether the mates overlap, and it prints the truncation length and the
+merge decision rather than assuming either. Those two are the parameters most likely to be
+wrong when a 16S pipeline is reused.
+
+Two things will not transfer. The exclusion of the two failed libraries is specific to this
+data, so check the depth table from step 06 for yours. And the covariates are hard-wired to
+age, sex and BMI, which are what this cohort records.
+
+If your reads do overlap, which most V3-V4 runs at 2 x 250 or 2 x 300 will, the denoising
+step needs `denoise-paired` rather than `denoise-single`. That is a change to
+`scripts/04_denoise.py`, not a config value.
 
 ## Limitations
 
@@ -173,6 +206,14 @@ regenerated by the workflow.
 
 QIIME 2 2025.7, DADA2, cutadapt, vsearch, MAFFT, FastTree, ANCOM-BC, SILVA 138, Snakemake.
 Citations for each are available through `qiime <plugin> --citations`.
+
+## Author
+
+**Muhammad Ahsan Rafi**
+M.S. Industrial Biotechnology, Atta-ur-Rahman School of Applied Biosciences (ASAB),
+National University of Sciences and Technology (NUST), Islamabad.
+
+[github.com/ahsan-omics](https://github.com/ahsan-omics)
 
 ## Licence
 
